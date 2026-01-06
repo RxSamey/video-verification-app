@@ -1,0 +1,12 @@
+opencv-python
+numpy
+pytesseract
+pandas
+openpyxl
+pdfplumber
+openai
+python-dotenv
+streamlit
+fastapi
+uvicorn
+tqdm
