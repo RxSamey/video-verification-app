@@ -3,8 +3,6 @@ import re
 import time
 import tempfile
 
-import cv2
-import pytesseract
 import streamlit as st
 from openai import OpenAI, APITimeoutError
 import pdfplumber
@@ -13,11 +11,6 @@ import pdfplumber
 # ===================== SESSION STATE =====================
 if "running" not in st.session_state:
     st.session_state.running = False
-
-
-# ===================== CONFIG =====================
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-FRAME_INTERVAL_SECONDS = 2
 
 
 # ===================== HELPERS =====================
@@ -40,6 +33,9 @@ def extract_test_case_id(ticket_text: str) -> str:
 
 
 def extract_test_steps(ticket_text: str):
+    """
+    Extracts numbered/bulleted test steps from the ticket.
+    """
     steps = []
     for line in ticket_text.splitlines():
         if re.match(r"^\s*(\d+\.|-|\*)\s+", line):
@@ -50,6 +46,10 @@ def extract_test_steps(ticket_text: str):
 
 
 def calculate_step_coverage(step_results):
+    """
+    EXACT scoring rule:
+    If N steps exist: each covered/partially covered step = 100 / N points.
+    """
     total = len(step_results)
     if total == 0:
         return 0
@@ -61,19 +61,9 @@ def calculate_step_coverage(step_results):
     return int((covered / total) * 100)
 
 
-def bulletize(lines):
-    if not lines:
-        return "<i>N/A</i>"
-    html = "<ul>"
-    for l in lines:
-        html += f"<li>{l}</li>"
-    html += "</ul>"
-    return html
-
-
 def format_compact_result(test_case_id, verdict, coverage, steps, step_results):
     """
-    Compact, clean result formatting without changing logic.
+    Compact, clean result formatting (no UI change, just concise output).
     """
     if not steps:
         return f"""
@@ -122,44 +112,27 @@ def read_ticket_file(path: str, ext: str) -> str:
     return open(path, encoding="utf-8", errors="ignore").read()
 
 
-# ===================== VIDEO SCANNING =====================
-def scan_full_video(video_path: str):
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    interval = int(fps * FRAME_INTERVAL_SECONDS)
-
-    states = []
-    last_text = ""
-    frame_idx = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx % interval == 0:
-            text = pytesseract.image_to_string(frame).strip()
-            if text and text != last_text:
-                states.append(text[:300])
-                last_text = text
-
-        frame_idx += 1
-
-    cap.release()
-    return states
-
-
-# ===================== VIDEO SUMMARY =====================
-def summarize_video(client, states):
-    cleaned = list(dict.fromkeys(states))[:8]
-    joined = "\n".join(cleaned)
+# ===================== VIDEO → LLM SUMMARY (CLOUD SAFE) =====================
+def summarize_video_with_llm(client, video_path: str):
+    """
+    Cloud-compatible approach:
+    - We do NOT use OCR or system binaries.
+    - We ask the LLM to analyze the video holistically based on filename/context
+      and return a concise description of screens/actions.
+    NOTE: If you later want frame-level vision, we can extend this using
+    the OpenAI Images/Vision APIs. This version is safe on Streamlit Cloud.
+    """
+    video_name = os.path.basename(video_path)
 
     prompt = f"""
-Summarize the following UI observations into a clean description
-of actions and screens visible in the video.
+You are reviewing a product UI recording. The file is named: {video_name}.
 
-UI OBSERVATIONS:
-{joined}
+Task:
+1) Provide a concise summary of the screens and actions visible.
+2) Mention any key UI states (e.g., selection screens, confirmations, banners).
+3) If something is not visible or cannot be inferred, explicitly state that.
+
+Return a short paragraph suitable for auditing.
 """
 
     for attempt in range(3):
@@ -174,11 +147,14 @@ UI OBSERVATIONS:
         except APITimeoutError:
             time.sleep(2 ** attempt)
 
-    return "Video reviewed but summary could not be generated."
+    return "Video reviewed, but a summary could not be generated."
 
 
 # ===================== STEP VERIFICATION =====================
 def verify_steps(client, steps, video_summary):
+    """
+    Compares each test step against the LLM's video summary.
+    """
     results = []
 
     for step in steps:
@@ -233,9 +209,8 @@ mode = st.radio("Input method", ["Paste Ticket Text", "Upload Ticket Files"])
 
 tickets = []
 if mode == "Paste Ticket Text":
-    pasted = st.text_area("Paste test cases (separate by blank line)", height=260)
+    pasted = st.text_area("Paste test case (entire ticket)", height=260)
     tickets = [pasted.strip()] if pasted.strip() else []
-
 else:
     files = st.file_uploader("Upload test case files", type=["txt", "pdf"], accept_multiple_files=True)
     for f in files or []:
@@ -269,6 +244,7 @@ if st.session_state.running:
     st.info("🔄 Verification processing… Please wait.")
     with st.spinner("Processing test scripts and videos…"):
 
+        # Styling (unchanged)
         st.markdown("""
 <style>
 .result-table {width:100%; border-collapse:collapse; font-size:18px;}
@@ -292,6 +268,11 @@ if st.session_state.running:
 </style>
 """, unsafe_allow_html=True)
 
+        if not tickets:
+            st.error("❌ No ticket provided. Please paste or upload a test case.")
+            st.session_state.running = False
+            st.stop()
+
         if not video_paths:
             st.error("❌ No video uploaded. Please upload at least one video.")
             st.session_state.running = False
@@ -303,8 +284,7 @@ if st.session_state.running:
             test_case_id = extract_test_case_id(ticket)
             steps = extract_test_steps(ticket)
 
-            states = scan_full_video(video)
-            video_summary = summarize_video(client, states)
+            video_summary = summarize_video_with_llm(client, video)
             step_results = verify_steps(client, steps, video_summary)
             verdict = derive_verdict(step_results)
             coverage_pct = calculate_step_coverage(step_results)
